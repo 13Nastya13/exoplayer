@@ -10,7 +10,7 @@
 
     <application
         android:label="flutter_exo_android"
-        android:name="${applicationName}"
+        android:name=".VideoPlayerApplication"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"

@@ -38,9 +38,15 @@ import androidx.media3.ui.PlayerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
 import java.net.URL
+import androidx.media3.exoplayer.offline.Download
+import androidx.media3.exoplayer.offline.DownloadManager
+import android.widget.ProgressBar
+import android.os.Handler
+import android.os.Looper
+import java.util.concurrent.Executor
 
 @UnstableApi
-class PlayerActivity : AppCompatActivity(), Player.Listener {
+class PlayerActivity : AppCompatActivity(), Player.Listener, DownloadManager.Listener {
 
     private lateinit var playerView: PlayerView
     private lateinit var player: ExoPlayer
@@ -69,6 +75,14 @@ class PlayerActivity : AppCompatActivity(), Player.Listener {
         "360p" to 360,
         "720p" to 720
     )
+
+    private var downloadProgressBar: ProgressBar? = null
+    private var downloadProgressDialog: AlertDialog? = null
+    private var downloadManager: DownloadManager? = null
+    private var progressHandler = Handler(Looper.getMainLooper())
+    private var progressRunnable: Runnable? = null
+    private var isDownloadTracking = false
+    private var downloadKey: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -131,6 +145,9 @@ class PlayerActivity : AppCompatActivity(), Player.Listener {
             
             // Setup the default resolutions immediately so we always have options
             setupDefaultResolutions()
+
+            // Initialize download manager for progress tracking
+            initDownloadManager()
         } catch (e: Exception) {
             Log.e(TAG, "Error in onCreate: ${e.message}")
             e.printStackTrace()
@@ -139,17 +156,22 @@ class PlayerActivity : AppCompatActivity(), Player.Listener {
     
     private fun checkIfVideoIsDownloaded(videoUrl: String) {
         try {
-            val downloadedFile = getDownloadedVideoFile(videoUrl)
-            isDownloaded = downloadedFile.exists()
+            // Get a reference to the download cache
+            val downloadCache = ExoCacheDatabase.getDownloadCache(this)
+            
+            // Create a unique key for this video
+            val key = videoUrl.hashCode().toString()
+            
+            // Check if the video is in the cache
+            isDownloaded = downloadCache.keys.contains(key)
             
             // Update the download button visibility based on whether the video is downloaded
             downloadButton.visibility = if (isDownloaded) View.GONE else View.VISIBLE
             
             // If video is downloaded, update the URL to the local file
             if (isDownloaded) {
-                Log.d(TAG, "Video is already downloaded: ${downloadedFile.absolutePath}")
+                Log.d(TAG, "Video is already downloaded with key: $key")
                 Toast.makeText(this, "Playing downloaded version", Toast.LENGTH_SHORT).show()
-                // We'll continue using the streaming URL in this implementation
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error checking if video is downloaded: ${e.message}")
@@ -198,9 +220,12 @@ class PlayerActivity : AppCompatActivity(), Player.Listener {
     
     private fun downloadVideo() {
         try {
+            // Generate a download key
+            downloadKey = currentVideoUrl.hashCode().toString()
+            
             // Create download request
             val downloadRequest = DownloadRequest.Builder(
-                currentVideoUrl.hashCode().toString(),
+                downloadKey,
                 Uri.parse(currentVideoUrl)
             ).build()
             
@@ -212,12 +237,11 @@ class PlayerActivity : AppCompatActivity(), Player.Listener {
                 false
             )
             
+            // Start tracking the download progress
+            startDownloadProgressTracking()
+            
             // Notify user
             Toast.makeText(this, "Download started", Toast.LENGTH_SHORT).show()
-            
-            // Update UI
-            downloadButton.visibility = View.GONE
-            isDownloaded = true
         } catch (e: Exception) {
             Log.e(TAG, "Error downloading video: ${e.message}")
             Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -700,7 +724,180 @@ class PlayerActivity : AppCompatActivity(), Player.Listener {
     }
 
     override fun onBackPressed() {
+        super.onBackPressed()
         // Handle hardware/system back button same as our UI back button
         handleBackPress()
+    }
+
+    private fun initDownloadManager() {
+        try {
+            // Get the download manager from the database
+            val dataSourceFactory = DefaultHttpDataSource.Factory()
+            val databaseProvider = ExoCacheDatabase.getInstance(this)
+            val downloadCache = ExoCacheDatabase.getDownloadCache(this)
+            
+            downloadManager = DownloadManager(
+                this,
+                databaseProvider,
+                downloadCache,
+                dataSourceFactory,
+                Executor { it.run() }
+            )
+            
+            // Add listener for download progress
+            downloadManager?.addListener(this)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing download manager: ${e.message}")
+        }
+    }
+
+    private fun startDownloadProgressTracking() {
+        // Create and show progress dialog
+        val dialogView = layoutInflater.inflate(R.layout.download_progress_dialog, null)
+        downloadProgressBar = dialogView.findViewById(R.id.downloadProgressBar)
+        
+        downloadProgressDialog = AlertDialog.Builder(this, R.style.AlertDialogTheme)
+            .setTitle("Downloading")
+            .setMessage("Downloading $currentVideoTitle")
+            .setView(dialogView)
+            .setCancelable(false)
+            .setNegativeButton("Hide") { dialog, _ ->
+                dialog.dismiss()
+                downloadProgressDialog = null
+                // Continue tracking in background
+            }
+            .setOnDismissListener {
+                // Dialog was dismissed, continue tracking in background
+            }
+            .create()
+        
+        downloadProgressDialog?.show()
+        
+        // Start tracking progress
+        isDownloadTracking = true
+        startProgressPolling()
+    }
+    
+    private fun startProgressPolling() {
+        progressRunnable = object : Runnable {
+            override fun run() {
+                updateDownloadProgress()
+                if (isDownloadTracking) {
+                    progressHandler.postDelayed(this, 1000) // Update every second
+                }
+            }
+        }
+        
+        progressHandler.post(progressRunnable!!)
+    }
+    
+    private fun updateDownloadProgress() {
+        try {
+            // Get the downloads
+            val downloads = downloadManager?.currentDownloads
+            
+            if (downloads.isNullOrEmpty()) {
+                return
+            }
+            
+            // Find our download
+            val download = downloads.find { it.request.id == downloadKey }
+            if (download != null) {
+                val state = download.state
+                val percent = if (download.contentLength > 0) {
+                    (download.bytesDownloaded * 100 / download.contentLength).toInt()
+                } else 0
+                
+                // Update UI based on state
+                runOnUiThread {
+                    downloadProgressBar?.progress = percent
+                    
+                    when (state) {
+                        Download.STATE_COMPLETED -> {
+                            downloadProgressDialog?.let {
+                                if (it.isShowing) {
+                                    it.setTitle("Download Complete")
+                                    it.setMessage("Download completed successfully!")
+                                    
+                                    // Change button to "Close"
+                                    it.getButton(AlertDialog.BUTTON_NEGATIVE)?.text = "Close"
+                                }
+                            }
+                            
+                            // Hide the download button
+                            downloadButton.visibility = View.GONE
+                            isDownloaded = true
+                            
+                            // Stop tracking
+                            stopDownloadTracking()
+                            
+                            Toast.makeText(this@PlayerActivity, 
+                                "Download completed!", Toast.LENGTH_SHORT).show()
+                        }
+                        Download.STATE_FAILED -> {
+                            downloadProgressDialog?.let {
+                                if (it.isShowing) {
+                                    it.setTitle("Download Failed")
+                                    it.setMessage("Download failed. Please try again.")
+                                    
+                                    // Change button to "Close"
+                                    it.getButton(AlertDialog.BUTTON_NEGATIVE)?.text = "Close"
+                                }
+                            }
+                            
+                            // Stop tracking
+                            stopDownloadTracking()
+                            
+                            Toast.makeText(this@PlayerActivity, 
+                                "Download failed!", Toast.LENGTH_SHORT).show()
+                        }
+                        else -> {
+                            downloadProgressDialog?.let {
+                                if (it.isShowing) {
+                                    it.setMessage("Downloading $currentVideoTitle ($percent%)")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating download progress: ${e.message}")
+        }
+    }
+    
+    private fun stopDownloadTracking() {
+        isDownloadTracking = false
+        progressRunnable?.let { progressHandler.removeCallbacks(it) }
+        progressRunnable = null
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        
+        // Clean up download tracking
+        stopDownloadTracking()
+        
+        // Remove listener
+        downloadManager?.removeListener(this)
+    }
+    
+    // DownloadManager.Listener implementation
+    override fun onDownloadChanged(
+        downloadManager: DownloadManager,
+        download: Download,
+        finalException: java.lang.Exception?
+    ) {
+        if (download.request.id == downloadKey) {
+            // Update progress when this specific download changes
+            updateDownloadProgress()
+        }
+    }
+    
+    override fun onDownloadRemoved(downloadManager: DownloadManager, download: Download) {
+        if (download.request.id == downloadKey) {
+            stopDownloadTracking()
+        }
     }
 } 

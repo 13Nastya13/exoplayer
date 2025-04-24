@@ -3,12 +3,18 @@ package com.example.flutter_exo_android
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.widget.Toast
 import androidx.annotation.OptIn
+import androidx.core.app.NotificationCompat
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.database.DatabaseProvider
-import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.common.util.Util
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.NoOpCacheEvictor
@@ -19,9 +25,9 @@ import androidx.media3.exoplayer.offline.DownloadNotificationHelper
 import androidx.media3.exoplayer.offline.DownloadService
 import androidx.media3.exoplayer.scheduler.PlatformScheduler
 import androidx.media3.exoplayer.scheduler.Scheduler
-import org.checkerframework.checker.nullness.qual.MonotonicNonNull
 import java.io.File
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 
 @OptIn(UnstableApi::class)
 class ExoDownloadService : DownloadService(
@@ -34,9 +40,6 @@ class ExoDownloadService : DownloadService(
     private lateinit var downloadManager: DownloadManager
     private lateinit var downloadNotificationHelper: DownloadNotificationHelper
     private val JOB_ID = 1
-
-    @OptIn(UnstableApi::class)
-    private var databaseProvider: @MonotonicNonNull DatabaseProvider? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -70,50 +73,39 @@ class ExoDownloadService : DownloadService(
             return downloadManager
         }
         
-        // Create download cache
-        val downloadDirectory = File(getExternalFilesDir(null), "downloads")
-        if (!downloadDirectory.exists()) {
-            downloadDirectory.mkdirs()
-        }
-        
-        // Create the download cache
-        val downloadCache: Cache = getDownloadCache()
-        
         // Create data source factory
         val dataSourceFactory = DefaultDataSource.Factory(this)
         
-        // Create the download manager
-        val newDownloadManager = DownloadManager(
-            this,
-            getDatabaseProvider(this),
-            getDownloadCache(),
-            dataSourceFactory,
-            Executor { it.run() }
-        )
+        // Get the download cache
+        val downloadCache = ExoCacheDatabase.getDownloadCache(this)
         
-        // Set maximum parallel downloads
-        newDownloadManager.maxParallelDownloads = 3
+        // Get database provider
+        val databaseProvider = ExoCacheDatabase.getInstance(this)
         
-        // Enable download resumption
-        newDownloadManager.resumeDownloads()
-        
-        // Return the download manager
-        return newDownloadManager
-    }
-
-    private fun getDownloadCache(): Cache {
-        // Create download directory
-        val downloadDirectory = File(getExternalFilesDir(null), "downloads")
-        if (!downloadDirectory.exists()) {
-            downloadDirectory.mkdirs()
+        // Create the download manager - constructor has changed in different versions
+        try {
+            // Try to create download manager using available constructor
+            val newDownloadManager = DownloadManager(
+                this,
+                databaseProvider,
+                downloadCache,
+                dataSourceFactory, 
+                Executor { it.run() }
+            )
+            
+            // Set download properties
+            newDownloadManager.maxParallelDownloads = 3
+            newDownloadManager.minRetryCount = 3
+            newDownloadManager.resumeDownloads()
+            
+            return newDownloadManager
+        } catch (e: Exception) {
+            Log.e("ExoDownloadService", "Error creating download manager: ${e.message}")
+            e.printStackTrace()
+            
+            // Fallback method if the above fails
+            throw e  // Rethrow to make error visible
         }
-        
-        // Create download cache
-        return SimpleCache(
-            downloadDirectory,
-            NoOpCacheEvictor(),
-            ExoCacheDatabase.getInstance(this)
-        )
     }
 
     override fun getScheduler(): Scheduler? {
@@ -125,7 +117,40 @@ class ExoDownloadService : DownloadService(
     }
 
     override fun getForegroundNotification(downloads: List<Download>, notMetRequirements: Int): Notification {
-        // Create notification for download progress
+        // If there are no downloads, use a simple notification
+        if (downloads.isEmpty()) {
+            return createProgressNotification("Download Starting", 0)
+        }
+        
+        // If there's a single download, create a dedicated notification
+        if (downloads.size == 1) {
+            val download = downloads[0]
+            val titleText = "Downloading Video"
+            val percentComplete = getDownloadPercentage(download)
+            
+            return when (download.state) {
+                Download.STATE_DOWNLOADING -> {
+                    createProgressNotification(
+                        "$titleText - $percentComplete%", 
+                        percentComplete
+                    )
+                }
+                Download.STATE_COMPLETED -> {
+                    createCompletedNotification(titleText)
+                }
+                Download.STATE_FAILED -> {
+                    createFailedNotification(titleText)
+                }
+                else -> {
+                    createProgressNotification(
+                        titleText, 
+                        percentComplete
+                    )
+                }
+            }
+        }
+        
+        // For multiple downloads, use the helper's default notification
         return downloadNotificationHelper.buildProgressNotification(
             this,
             R.drawable.ic_download,
@@ -135,19 +160,88 @@ class ExoDownloadService : DownloadService(
             notMetRequirements
         )
     }
-
-    @OptIn(UnstableApi::class)
-    @Synchronized
-    private fun getDatabaseProvider(context: Context): DatabaseProvider {
-        if (databaseProvider == null) {
-            databaseProvider =
-                StandaloneDatabaseProvider(context)
+    
+    private fun getDownloadPercentage(download: Download): Int {
+        return if (download.contentLength > 0) {
+            (download.bytesDownloaded * 100 / download.contentLength).toInt()
+        } else {
+            0
         }
-        return databaseProvider!!
+    }
+    
+    private fun createProgressNotification(title: String, progress: Int): Notification {
+        // Create a notification builder
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_download)
+            .setContentTitle(title)
+            .setOngoing(true)
+            .setProgress(100, progress, false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            
+        // Add cancel action if supported
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Create a cancel intent
+            val cancelIntent = Intent(this, ExoDownloadService::class.java).apply {
+                action = ACTION_CANCEL_DOWNLOADS
+            }
+            
+            val pendingIntent = PendingIntent.getService(
+                this, 0, cancelIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            
+            builder.addAction(
+                R.drawable.ic_download, 
+                "Cancel", 
+                pendingIntent
+            )
+        }
+            
+        return builder.build()
+    }
+    
+    private fun createCompletedNotification(title: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_download)
+            .setContentTitle("$title - Completed")
+            .setContentText("Download completed successfully")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+    
+    private fun createFailedNotification(title: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_download)
+            .setContentTitle("$title - Failed")
+            .setContentText("Download failed. Please try again.")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent != null) {
+            val action = intent.action
+            if (action == ACTION_CANCEL_DOWNLOADS) {
+                // Cancel all downloads
+                downloadManager.removeAllDownloads()
+                
+                // Show a toast about cancellation
+                val handler = Handler(Looper.getMainLooper())
+                handler.post {
+                    Toast.makeText(this, "Download canceled", Toast.LENGTH_SHORT).show()
+                }
+                
+                // Stop the service
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+        }
+        return super.onStartCommand(intent, flags, startId)
     }
 
     companion object {
         private const val CHANNEL_ID = "download_channel"
         private const val FOREGROUND_NOTIFICATION_ID = 1
+        const val ACTION_CANCEL_DOWNLOADS = "action_cancel_downloads"
     }
 } 
